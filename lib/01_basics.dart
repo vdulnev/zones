@@ -17,6 +17,7 @@ void main() async {
   await example2_forkAndRun();
   await example3_identityAcrossAsync();
   example4_nestedZones();
+  await example5_overridePrintAndErrors();
 }
 
 // ---------------------------------------------------------------------------
@@ -126,5 +127,39 @@ void example4_nestedZones() {
   print('level2a.inSameErrorZone(level2b): '
       '${level2a.inSameErrorZone(level2b)}');
 
+  print('');
+}
+
+// ---------------------------------------------------------------------------
+// Example 5: Override print, microtasks, and errors with ZoneSpecification
+// ---------------------------------------------------------------------------
+Future<void> example5_overridePrintAndErrors() async {
+  print('--- Example 5: ZoneSpecification — override print, microtasks & errors ---');
+
+  // Override print and handle uncaught errors in a custom zone.
+  runZonedGuarded(
+    () {
+      // This print goes through the zone's handlePrint override.
+      print('Hello from custom zone');
+
+      // Schedule a microtask — also runs inside the zone.
+      scheduleMicrotask(() => print('Microtask inside zone'));
+
+      // Throw to demonstrate error handling.
+      throw StateError('Something went wrong');
+    },
+    (error, stack) {
+      print('Caught by zone error handler: $error');
+    },
+    zoneSpecification: ZoneSpecification(
+      // Intercept every print() call and prefix it.
+      print: (self, parent, zone, line) {
+        parent.print(zone, '[ZONE] $line');
+      },
+    ),
+  );
+
+  // Wait for the microtask to complete before the next example.
+  await Future.delayed(Duration.zero);
   print('');
 }
