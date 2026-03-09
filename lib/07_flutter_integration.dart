@@ -253,6 +253,39 @@ class _ErrorLayersDemoState extends State<_ErrorLayersDemo> {
     ));
   }
 
+  // Simulate a PlatformDispatcher error.
+  //
+  // In production this handler is invoked by Flutter for errors that originate
+  // outside the widget tree and outside any Dart zone:
+  //   • Uncaught errors forwarded from platform channels (MethodChannel,
+  //     EventChannel) before they reach Dart zone error handling.
+  //   • Errors thrown in isolate message handlers that Flutter surfaces to the
+  //     root isolate.
+  //   • Any error that the Flutter engine itself routes through
+  //     PlatformDispatcher before the zone system sees it.
+  //
+  // Returning true marks the error handled; returning false lets Flutter
+  // terminate the app (same as an unhandled exception in release mode).
+  //
+  // We call the handler directly here because there is no safe way to trigger
+  // a real platform-channel error from a button tap in a demo.
+  void _simulatePlatformDispatcherError() {
+    final error = StateError(
+      'Simulated PlatformDispatcher error '
+      '(e.g. uncaught MethodChannel reply on background isolate)',
+    );
+    final stack = StackTrace.current;
+    final handled = PlatformDispatcher.instance.onError?.call(error, stack);
+    if (handled != true) {
+      // onError not set — fall back to zone handler so the demo still works.
+      ErrorReporter.report(
+        error,
+        stack,
+        source: 'PlatformDispatcher (fallback)',
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -263,8 +296,11 @@ class _ErrorLayersDemoState extends State<_ErrorLayersDemo> {
           description:
               'Flutter needs three separate handlers to achieve 100% error coverage.\n\n'
               '① FlutterError.onError — widget build/layout/paint\n'
-              '② PlatformDispatcher.onError — platform channel & isolate\n'
-              '③ runZonedGuarded — Timer callbacks, raw async, everything else',
+              '② PlatformDispatcher.onError — platform channels & isolate bridge\n'
+              '③ runZonedGuarded — Timer callbacks, raw async, everything else\n\n'
+              'PlatformDispatcher.instance.onError is set once in main() and '
+              'invoked by the Flutter engine for errors that arrive outside the '
+              'widget tree. Return true to mark the error handled.',
           child: Column(
             children: [
               const _LayerDiagram(),
@@ -284,6 +320,10 @@ class _ErrorLayersDemoState extends State<_ErrorLayersDemo> {
                   FilledButton.tonal(
                     onPressed: _throwFlutterError,
                     child: const Text('FlutterError layer'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: _simulatePlatformDispatcherError,
+                    child: const Text('PlatformDispatcher layer'),
                   ),
                   OutlinedButton(
                     onPressed: ErrorReporter.clear,
