@@ -52,32 +52,87 @@ Future<void> example1_interceptPrint() async {
 }
 
 // ---------------------------------------------------------------------------
-// Example 2: Intercepting scheduleMicrotask
+// Example 2: Five ways to override scheduleMicrotask
 // ---------------------------------------------------------------------------
 Future<void> example2_interceptMicrotask() async {
-  print('--- Example 2: Intercepting scheduleMicrotask ---');
+  print('--- Example 2: Five scheduleMicrotask override patterns ---');
 
-  int microtaskCount = 0;
-
-  final zone = Zone.current.fork(
+  // --- 2a: Wrap — log before and after ---
+  await Zone.current.fork(
     specification: ZoneSpecification(
-      scheduleMicrotask: (self, parent, zone, f) {
-        microtaskCount++;
-        print('Scheduling microtask #$microtaskCount');
-        // Always delegate to parent so microtasks still run.
-        parent.scheduleMicrotask(zone, f);
+      scheduleMicrotask: (self, parent, zone, fn) {
+        parent.print(zone, '  [wrap] scheduling');
+        parent.scheduleMicrotask(zone, () {
+          parent.print(zone, '  [wrap] running');
+          fn();
+        });
       },
     ),
-  );
-
-  await zone.run(() async {
-    scheduleMicrotask(() => print('microtask A'));
-    scheduleMicrotask(() => print('microtask B'));
-    // Awaiting yields to event loop, flushing the microtask queue.
+  ).run(() async {
+    scheduleMicrotask(() => print('  [wrap] microtask body'));
     await Future.delayed(Duration.zero);
   });
 
-  print('Total microtasks scheduled: $microtaskCount');
+  // --- 2b: Delay — defer into a timer instead of the microtask queue ---
+  await Zone.current.fork(
+    specification: ZoneSpecification(
+      scheduleMicrotask: (self, parent, zone, fn) {
+        // Runs after a short timer rather than immediately.
+        parent.createTimer(zone, const Duration(milliseconds: 5), fn);
+      },
+    ),
+  ).run(() async {
+    scheduleMicrotask(() => print('  [delay] ran after timer'));
+    await Future.delayed(const Duration(milliseconds: 10));
+  });
+
+  // --- 2c: Drop — suppress execution (mirrors fake_async test technique) ---
+  final dropped = <String>[];
+  Zone.current.fork(
+    specification: ZoneSpecification(
+      scheduleMicrotask: (self, parent, zone, fn) {
+        dropped.add('suppressed');
+        // fn is never called.
+      },
+    ),
+  ).run(() {
+    scheduleMicrotask(() => print('  [drop] should NOT appear'));
+  });
+  await Future.delayed(Duration.zero);
+  print('  [drop] microtasks suppressed: ${dropped.length}');
+
+  // --- 2d: Run synchronously — execute immediately instead of queuing ---
+  print('  [sync] before scheduleMicrotask');
+  Zone.current.fork(
+    specification: ZoneSpecification(
+      scheduleMicrotask: (self, parent, zone, fn) {
+        fn(); // runs now, inline
+      },
+    ),
+  ).run(() {
+    scheduleMicrotask(() => print('  [sync] ran inline, not queued'));
+  });
+  print('  [sync] after scheduleMicrotask');
+
+  // --- 2e: Redirect — run in a different zone (e.g. Zone.root) ---
+  // fn is already zone-bound to the child, so wrap it in a fresh closure
+  // registered by Zone.root — that wrapper runs in root, then calls fn().
+  Zone? microtaskZone;
+  Zone.current.fork().fork(
+    specification: ZoneSpecification(
+      scheduleMicrotask: (self, parent, zone, fn) {
+        Zone.root.scheduleMicrotask(() {
+          microtaskZone = Zone.current; // captured while running in root
+          fn();
+        });
+      },
+    ),
+  ).run(() {
+    scheduleMicrotask(() {});
+  });
+  await Future.delayed(Duration.zero);
+  print('  [redirect] wrapper ran in root? ${microtaskZone == Zone.root}');
+
   print('');
 }
 
