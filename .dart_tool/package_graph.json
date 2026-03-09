@@ -1,0 +1,14 @@
+{
+  "roots": [
+    "zones_course"
+  ],
+  "packages": [
+    {
+      "name": "zones_course",
+      "version": "1.0.0",
+      "dependencies": [],
+      "devDependencies": []
+    }
+  ],
+  "configVersion": 1
+}

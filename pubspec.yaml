@@ -1,0 +1,6 @@
+name: zones_course
+description: Learning course — Dart Zones with hands-on examples
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
