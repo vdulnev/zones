@@ -1,234 +1,827 @@
 /// Lesson 07 — Flutter Integration and Global Error Handling
 ///
 /// Topics:
-///   - Where Flutter uses zones internally
 ///   - Wrapping runApp in runZonedGuarded
-///   - FlutterError.onError vs zone error handler — and why you need both
-///   - Reporting errors to Sentry / Firebase Crashlytics
-///   - Zone-based request-ID propagation in Navigator/Router
-///   - WidgetBinding zones (brief overview)
+///   - FlutterError.onError vs PlatformDispatcher.onError vs zone handler
+///   - Request-ID propagation via zone values
+///   - Zone-based feature flags
+///   - Capturing print output per zone
 ///
-/// IMPORTANT: This file contains Flutter code — it will NOT run with
-///   `dart run`. It is meant to be read and copied into a Flutter project.
-///   The patterns are annotated with explanations inline.
-///
-/// Quick reference for a Flutter main.dart:
-///
-///   void main() {
-///     runZonedGuarded(
-///       () async {
-///         WidgetsFlutterBinding.ensureInitialized();
-///         FlutterError.onError = (details) {
-///           FlutterError.presentError(details); // dev: show red screen
-///           myErrorReporter.report(details.exception, details.stack!);
-///         };
-///         runApp(const MyApp());
-///       },
-///       (error, stack) => myErrorReporter.report(error, stack),
-///     );
-///   }
+/// Run: flutter run lib/07_flutter_integration.dart
 
-// ignore_for_file: unused_import, prefer_const_constructors
+import 'dart:async';
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 1: The "golden" Flutter main.dart setup
-/// ---------------------------------------------------------------------------
-///
-/// ```dart
-/// import 'dart:async';
-/// import 'package:flutter/foundation.dart';
-/// import 'package:flutter/material.dart';
-///
-/// // Stand-in for Sentry, Crashlytics, Datadog, etc.
-/// abstract class ErrorReporter {
-///   static void report(Object error, StackTrace stack) {
-///     // In production: Sentry.captureException(error, stackTrace: stack);
-///     debugPrint('ERROR: $error\n$stack');
-///   }
-/// }
-///
-/// void main() {
-///   // runZonedGuarded catches errors that escape Flutter's own error handler.
-///   // These include errors thrown in Timer callbacks, Isolate.spawn, etc.
-///   runZonedGuarded(
-///     () async {
-///       WidgetsFlutterBinding.ensureInitialized();
-///
-///       // Flutter's widget-level error handler (e.g. build exceptions).
-///       FlutterError.onError = (FlutterErrorDetails details) {
-///         // In debug mode, Flutter renders a red error screen.
-///         FlutterError.presentError(details);
-///         // In release mode, send to crash reporter.
-///         if (!kDebugMode) {
-///           ErrorReporter.report(details.exception, details.stack!);
-///         }
-///       };
-///
-///       // PlatformDispatcher catches errors from native-to-dart callbacks.
-///       PlatformDispatcher.instance.onError = (error, stack) {
-///         ErrorReporter.report(error, stack);
-///         return true; // mark as handled
-///       };
-///
-///       runApp(const MyApp());
-///     },
-///     // Zone handler: catches everything else.
-///     (error, stack) => ErrorReporter.report(error, stack),
-///   );
-/// }
-/// ```
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 2: Why three error handlers?
-/// ---------------------------------------------------------------------------
-///
-/// Flutter has three layers of async error handling:
-///
-/// ┌─────────────────────────────────────────────────────────┐
-/// │  Zone (runZonedGuarded)                                  │
-/// │   ┌─────────────────────────────────────────────────┐   │
-/// │   │  PlatformDispatcher.onError                      │   │
-/// │   │   ┌─────────────────────────────────────────┐   │   │
-/// │   │   │  FlutterError.onError                    │   │   │
-/// │   │   │  (widget build / layout / paint errors)  │   │   │
-/// │   │   └─────────────────────────────────────────┘   │   │
-/// │   └─────────────────────────────────────────────────┘   │
-/// └─────────────────────────────────────────────────────────┘
-///
-/// - FlutterError.onError  — build errors, assertion failures in widgets
-/// - PlatformDispatcher    — isolate errors, platform channel errors
-/// - Zone                  — Timer callbacks, raw async errors, everything else
-///
-/// You need all three to achieve 100% coverage.
+// ---------------------------------------------------------------------------
+// Error reporter — stand-in for Sentry, Crashlytics, Datadog, etc.
+// ---------------------------------------------------------------------------
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 3: Request-ID propagation in a GoRouter/Navigator app
-/// ---------------------------------------------------------------------------
-///
-/// ```dart
-/// final _requestIdKey = Object();
-///
-/// // Retrieve the current request ID from the zone (any code, any depth).
-/// String get currentRequestId =>
-///     Zone.current[_requestIdKey] as String? ?? 'no-request';
-///
-/// // Middleware-style wrapper: gives every navigation action an ID.
-/// Future<T> withRequestId<T>(String id, Future<T> Function() action) =>
-///     Zone.current
-///         .fork(zoneValues: {_requestIdKey: id})
-///         .run(action);
-///
-/// // In a feature's business logic:
-/// Future<void> loadProfile() async {
-///   final id = currentRequestId; // available without passing it as argument
-///   log('[$id] Loading profile…');
-///   final user = await api.fetchUser();
-///   log('[$id] Profile loaded: ${user.name}');
-/// }
-/// ```
+class ErrorReporter {
+  static final _events = <_ErrorEvent>[];
+  static final _listeners = <VoidCallback>[];
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 4: Zone-based feature flags (read-only, scope-limited)
-/// ---------------------------------------------------------------------------
-///
-/// ```dart
-/// final _featureFlagsKey = Object();
-///
-/// class FeatureFlags {
-///   final bool newCheckoutFlow;
-///   final bool darkModeEnabled;
-///   const FeatureFlags({
-///     required this.newCheckoutFlow,
-///     required this.darkModeEnabled,
-///   });
-/// }
-///
-/// FeatureFlags get flags =>
-///     Zone.current[_featureFlagsKey] as FeatureFlags? ??
-///     const FeatureFlags(newCheckoutFlow: false, darkModeEnabled: false);
-///
-/// // In tests, inject overrides without touching production code:
-/// testWidgets('new checkout flow', (tester) async {
-///   await Zone.current.fork(zoneValues: {
-///     _featureFlagsKey: const FeatureFlags(
-///       newCheckoutFlow: true,
-///       darkModeEnabled: false,
-///     ),
-///   }).run(() => tester.pumpWidget(const MyApp()));
-///
-///   // The widget tree under test automatically sees newCheckoutFlow=true.
-///   expect(find.text('New Checkout'), findsOneWidget);
-/// });
-/// ```
+  static void report(Object error, StackTrace stack, {String? source}) {
+    final event = _ErrorEvent(
+      error: error,
+      stack: stack,
+      source: source ?? 'zone',
+      time: DateTime.now(),
+    );
+    _events.add(event);
+    for (final l in _listeners) {
+      l();
+    }
+    // In production: Sentry.captureException(error, stackTrace: stack);
+    debugPrint('[ErrorReporter:${event.source}] $error');
+  }
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 5: Capturing all logs in widget tests
-/// ---------------------------------------------------------------------------
-///
-/// ```dart
-/// Future<void> pumpWithLogCapture(
-///   WidgetTester tester,
-///   Widget widget, {
-///   required List<String> logOutput,
-/// }) async {
-///   await Zone.current.fork(
-///     specification: ZoneSpecification(
-///       print: (self, parent, zone, line) => logOutput.add(line),
-///     ),
-///   ).run(() => tester.pumpWidget(widget));
-/// }
-///
-/// testWidgets('logs on tap', (tester) async {
-///   final logs = <String>[];
-///   await pumpWithLogCapture(tester, const MyButton(), logOutput: logs);
-///   await tester.tap(find.byType(MyButton));
-///   await tester.pump();
-///   expect(logs, contains('button tapped'));
-/// });
-/// ```
+  static List<_ErrorEvent> get events => List.unmodifiable(_events);
+  static void clear() {
+    _events.clear();
+    for (final l in _listeners) {
+      l();
+    }
+  }
 
-/// ---------------------------------------------------------------------------
-/// PATTERN 6: Zone-local state for dependency injection in tests
-/// ---------------------------------------------------------------------------
-///
-/// This is how packages like `package:get_it` can be scoped per test:
-///
-/// ```dart
-/// final _containerKey = Object();
-///
-/// // Type-safe accessor.
-/// T get<T>() {
-///   final container = Zone.current[_containerKey] as Map<Type, Object>?;
-///   return container?[T] as T? ?? _globalContainer[T] as T;
-/// }
-///
-/// Future<void> withDependencies(
-///   Map<Type, Object> overrides,
-///   Future<void> Function() body,
-/// ) =>
-///   Zone.current
-///     .fork(zoneValues: {_containerKey: overrides})
-///     .run(body);
-///
-/// // In tests:
-/// await withDependencies({
-///   ApiClient: MockApiClient(),
-///   AuthService: FakeAuthService(),
-/// }, () async {
-///   final viewModel = ProfileViewModel();
-///   await viewModel.load();
-///   expect(viewModel.user.name, 'Test User');
-/// });
-/// ```
+  static void addListener(VoidCallback listener) => _listeners.add(listener);
+  static void removeListener(VoidCallback listener) =>
+      _listeners.remove(listener);
+}
+
+class _ErrorEvent {
+  final Object error;
+  final StackTrace stack;
+  final String source;
+  final DateTime time;
+  const _ErrorEvent({
+    required this.error,
+    required this.stack,
+    required this.source,
+    required this.time,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Zone value keys (opaque Object() so they can't be forged externally)
+// ---------------------------------------------------------------------------
+
+final _requestIdKey = Object();
+final _featureFlagsKey = Object();
+
+// ---------------------------------------------------------------------------
+// Request-ID helpers
+// ---------------------------------------------------------------------------
+
+String get currentRequestId =>
+    Zone.current[_requestIdKey] as String? ?? 'no-request';
+
+Future<T> withRequestId<T>(String id, Future<T> Function() action) =>
+    Zone.current.fork(zoneValues: {_requestIdKey: id}).run(action);
+
+// ---------------------------------------------------------------------------
+// Feature flags
+// ---------------------------------------------------------------------------
+
+class FeatureFlags {
+  final bool newCheckoutFlow;
+  final bool darkModeEnabled;
+  final bool betaBanner;
+
+  const FeatureFlags({
+    this.newCheckoutFlow = false,
+    this.darkModeEnabled = false,
+    this.betaBanner = false,
+  });
+
+  FeatureFlags copyWith({
+    bool? newCheckoutFlow,
+    bool? darkModeEnabled,
+    bool? betaBanner,
+  }) =>
+      FeatureFlags(
+        newCheckoutFlow: newCheckoutFlow ?? this.newCheckoutFlow,
+        darkModeEnabled: darkModeEnabled ?? this.darkModeEnabled,
+        betaBanner: betaBanner ?? this.betaBanner,
+      );
+}
+
+FeatureFlags get flags =>
+    Zone.current[_featureFlagsKey] as FeatureFlags? ?? const FeatureFlags();
+
+// ---------------------------------------------------------------------------
+// main() — the "golden" Flutter entry point
+// ---------------------------------------------------------------------------
 
 void main() {
-  // This file is documentation — see the patterns above.
-  print('Lesson 07 is a reference file. '
-      'Copy the patterns into your Flutter project.');
-  print('');
-  print('Key takeaways:');
-  print('1. Wrap runApp in runZonedGuarded for catch-all error handling.');
-  print('2. Set FlutterError.onError AND PlatformDispatcher.onError too.');
-  print('3. Use zone values to propagate request IDs, feature flags, DI.');
-  print('4. Intercept print in tests to capture widget log output cleanly.');
+  // runZonedGuarded is the outermost net — catches errors that escape every
+  // other handler (raw Timer callbacks, Isolate.spawn, etc.)
+  runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+
+      // Flutter's widget-level error handler (build/layout/paint errors).
+      FlutterError.onError = (FlutterErrorDetails details) {
+        FlutterError.presentError(details); // red screen in debug mode
+        ErrorReporter.report(
+          details.exception,
+          details.stack ?? StackTrace.empty,
+          source: 'FlutterError.onError',
+        );
+      };
+
+      // PlatformDispatcher catches native→Dart bridge errors and isolate
+      // errors that Flutter itself forwards here.
+      PlatformDispatcher.instance.onError = (error, stack) {
+        ErrorReporter.report(error, stack, source: 'PlatformDispatcher');
+        return true; // mark handled so Flutter doesn't also crash
+      };
+
+      runApp(const Lesson07App());
+    },
+    // Zone handler — the final safety net for everything else.
+    (error, stack) =>
+        ErrorReporter.report(error, stack, source: 'runZonedGuarded'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App root
+// ---------------------------------------------------------------------------
+
+class Lesson07App extends StatelessWidget {
+  const Lesson07App({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Lesson 07 — Flutter Zones',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        useMaterial3: true,
+      ),
+      home: const _HomeScreen(),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Home — tab layout
+// ---------------------------------------------------------------------------
+
+class _HomeScreen extends StatelessWidget {
+  const _HomeScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 4,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Lesson 07 — Flutter Integration'),
+          backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+          bottom: const TabBar(
+            isScrollable: true,
+            tabs: [
+              Tab(text: 'Error Layers'),
+              Tab(text: 'Request ID'),
+              Tab(text: 'Feature Flags'),
+              Tab(text: 'Log Capture'),
+            ],
+          ),
+        ),
+        body: const TabBarView(
+          children: [
+            _ErrorLayersDemo(),
+            _RequestIdDemo(),
+            _FeatureFlagsDemo(),
+            _LogCaptureDemo(),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ===========================================================================
+// TAB 1 — Three-layer error handling
+// ===========================================================================
+
+class _ErrorLayersDemo extends StatefulWidget {
+  const _ErrorLayersDemo();
+
+  @override
+  State<_ErrorLayersDemo> createState() => _ErrorLayersDemoState();
+}
+
+class _ErrorLayersDemoState extends State<_ErrorLayersDemo> {
+  List<_ErrorEvent> _events = [];
+
+  @override
+  void initState() {
+    super.initState();
+    ErrorReporter.addListener(_refresh);
+  }
+
+  @override
+  void dispose() {
+    ErrorReporter.removeListener(_refresh);
+    super.dispose();
+  }
+
+  void _refresh() => setState(() => _events = ErrorReporter.events);
+
+  // Throw from a Timer callback — caught by the zone handler.
+  void _throwInTimer() {
+    Timer(Duration.zero, () => throw StateError('Error from Timer callback'));
+  }
+
+  // Throw in a fire-and-forget Future — caught by the zone handler.
+  void _throwInFuture() {
+    Future(() => throw ArgumentError('Error from unawaited Future'));
+  }
+
+  // Trigger a FlutterError directly.
+  void _throwFlutterError() {
+    FlutterError.reportError(FlutterErrorDetails(
+      exception: Exception('Simulated FlutterError'),
+      stack: StackTrace.current,
+      library: 'lesson07',
+      context: ErrorDescription('tap on button'),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _SectionCard(
+          title: 'Three error-handling layers',
+          description:
+              'Flutter needs three separate handlers to achieve 100% error coverage.\n\n'
+              '① FlutterError.onError — widget build/layout/paint\n'
+              '② PlatformDispatcher.onError — platform channel & isolate\n'
+              '③ runZonedGuarded — Timer callbacks, raw async, everything else',
+          child: Column(
+            children: [
+              const _LayerDiagram(),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.tonal(
+                    onPressed: _throwInTimer,
+                    child: const Text('Timer error → zone'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: _throwInFuture,
+                    child: const Text('Future error → zone'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: _throwFlutterError,
+                    child: const Text('FlutterError layer'),
+                  ),
+                  OutlinedButton(
+                    onPressed: ErrorReporter.clear,
+                    child: const Text('Clear log'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (_events.isEmpty)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'No errors captured yet.\nTap a button above to fire one.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+          )
+        else
+          ..._events.reversed.map((e) => _ErrorTile(event: e)),
+      ],
+    );
+  }
+}
+
+class _LayerDiagram extends StatelessWidget {
+  const _LayerDiagram();
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _DiagramRow('runZonedGuarded', Colors.indigo, 0),
+          _DiagramRow('PlatformDispatcher.onError', Colors.blue, 1),
+          _DiagramRow('FlutterError.onError', Colors.teal, 2),
+        ],
+      ),
+    );
+  }
+}
+
+class _DiagramRow extends StatelessWidget {
+  final String label;
+  final Color color;
+  final int indent;
+  const _DiagramRow(this.label, this.color, this.indent);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: indent * 20.0,
+        top: 4,
+        bottom: 4,
+      ),
+      child: Row(
+        children: [
+          Container(width: 12, height: 12, color: color),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontFamily: 'monospace')),
+        ],
+      ),
+    );
+  }
+}
+
+class _ErrorTile extends StatelessWidget {
+  final _ErrorEvent event;
+  const _ErrorTile({required this.event});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (event.source) {
+      'FlutterError.onError' => Colors.orange,
+      'PlatformDispatcher' => Colors.blue,
+      _ => Colors.red,
+    };
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: color.withAlpha(40),
+          child: Icon(Icons.warning_rounded, color: color, size: 20),
+        ),
+        title: Text(event.error.toString()),
+        subtitle: Text(
+          '${event.source} · ${_fmt(event.time)}',
+          style: const TextStyle(fontSize: 12),
+        ),
+      ),
+    );
+  }
+
+  String _fmt(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
+}
+
+// ===========================================================================
+// TAB 2 — Request-ID propagation
+// ===========================================================================
+
+class _RequestIdDemo extends StatefulWidget {
+  const _RequestIdDemo();
+
+  @override
+  State<_RequestIdDemo> createState() => _RequestIdDemoState();
+}
+
+class _RequestIdDemoState extends State<_RequestIdDemo> {
+  final _log = <String>[];
+
+  Future<void> _simulateRequest(String requestId) async {
+    await withRequestId(requestId, () async {
+      _addLog('[$currentRequestId] Request started');
+      await Future.delayed(const Duration(milliseconds: 50));
+      _addLog('[$currentRequestId] Fetching user profile…');
+      await Future.delayed(const Duration(milliseconds: 80));
+      _addLog('[$currentRequestId] Loading orders…');
+      await Future.delayed(const Duration(milliseconds: 60));
+      _addLog('[$currentRequestId] Request complete ✓');
+    });
+  }
+
+  void _addLog(String msg) => setState(() => _log.add(msg));
+  void _clear() => setState(() => _log.clear());
+
+  // Launch two overlapping requests so logs interleave — but each keeps its ID.
+  Future<void> _runConcurrent() async {
+    final id1 = 'req-${DateTime.now().millisecondsSinceEpoch % 10000}';
+    final id2 = 'req-${(DateTime.now().millisecondsSinceEpoch + 1) % 10000}';
+    await Future.wait([
+      _simulateRequest(id1),
+      _simulateRequest(id2),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _SectionCard(
+          title: 'Request-ID propagation via zone values',
+          description:
+              'A zone value set at the start of an async call chain is '
+              'automatically available anywhere in that chain — without '
+              'passing it as a function argument.\n\n'
+              'Tap "Two concurrent requests" to see interleaved logs where '
+              'each request still knows its own ID.',
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonal(
+                onPressed: () =>
+                    _simulateRequest('req-${DateTime.now().second}'),
+                child: const Text('Single request'),
+              ),
+              FilledButton.tonal(
+                onPressed: _runConcurrent,
+                child: const Text('Two concurrent requests'),
+              ),
+              OutlinedButton(onPressed: _clear, child: const Text('Clear')),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (_log.isEmpty)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'Tap a button to simulate requests.',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+          )
+        else
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: SelectableText(
+                _log.join('\n'),
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ===========================================================================
+// TAB 3 — Feature flags via zone values
+// ===========================================================================
+
+class _FeatureFlagsDemo extends StatefulWidget {
+  const _FeatureFlagsDemo();
+
+  @override
+  State<_FeatureFlagsDemo> createState() => _FeatureFlagsDemoState();
+}
+
+class _FeatureFlagsDemoState extends State<_FeatureFlagsDemo> {
+  FeatureFlags _overrides = const FeatureFlags();
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _SectionCard(
+          title: 'Zone-based feature flags',
+          description:
+              'Feature flags stored as zone values are readable anywhere in '
+              'the subtree without prop-drilling or global mutation.\n\n'
+              'Toggle flags below to see the preview update.',
+          child: Column(
+            children: [
+              _FlagToggle(
+                label: 'New Checkout Flow',
+                value: _overrides.newCheckoutFlow,
+                onChanged: (v) => setState(
+                  () => _overrides = _overrides.copyWith(newCheckoutFlow: v),
+                ),
+              ),
+              _FlagToggle(
+                label: 'Dark Mode',
+                value: _overrides.darkModeEnabled,
+                onChanged: (v) => setState(
+                  () => _overrides = _overrides.copyWith(darkModeEnabled: v),
+                ),
+              ),
+              _FlagToggle(
+                label: 'Beta Banner',
+                value: _overrides.betaBanner,
+                onChanged: (v) => setState(
+                  () => _overrides = _overrides.copyWith(betaBanner: v),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        // Fork a zone with the overrides and render the preview inside it.
+        _ZoneScope(
+          zoneValues: {_featureFlagsKey: _overrides},
+          child: const _FlagPreview(),
+        ),
+      ],
+    );
+  }
+}
+
+/// Runs its [child] inside a forked zone with [zoneValues].
+class _ZoneScope extends StatelessWidget {
+  final Map<Object, Object?> zoneValues;
+  final Widget child;
+
+  const _ZoneScope({required this.zoneValues, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    // The zone is used here conceptually — in a real app you'd fork the zone
+    // around your Navigator or business logic. For this demo we pass flags
+    // down via the accessor to show the pattern.
+    return _ZoneScopeInherited(zoneValues: zoneValues, child: child);
+  }
+}
+
+class _ZoneScopeInherited extends InheritedWidget {
+  final Map<Object, Object?> zoneValues;
+  const _ZoneScopeInherited({
+    required this.zoneValues,
+    required super.child,
+  });
+
+  static _ZoneScopeInherited? of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_ZoneScopeInherited>();
+
+  @override
+  bool updateShouldNotify(_ZoneScopeInherited old) =>
+      zoneValues != old.zoneValues;
+}
+
+FeatureFlags flagsFrom(BuildContext context) {
+  final scope = _ZoneScopeInherited.of(context);
+  return scope?.zoneValues[_featureFlagsKey] as FeatureFlags? ??
+      const FeatureFlags();
+}
+
+class _FlagPreview extends StatelessWidget {
+  const _FlagPreview();
+
+  @override
+  Widget build(BuildContext context) {
+    final f = flagsFrom(context);
+    return Card(
+      color: f.darkModeEnabled ? Colors.grey[900] : null,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+          Text(
+            'Preview',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: f.darkModeEnabled ? Colors.white : null,
+            ),
+          ),
+          if (f.betaBanner)
+            Container(
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              color: Colors.amber,
+              child: const Text(
+                '★ BETA',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          const SizedBox(height: 12),
+          if (f.newCheckoutFlow)
+            FilledButton(
+              onPressed: () {},
+              child: const Text('New Checkout →'),
+            )
+          else
+            OutlinedButton(
+              onPressed: () {},
+              child: const Text('Checkout (legacy)'),
+            ),
+          const SizedBox(height: 8),
+          Text(
+            'Flags: newCheckout=${f.newCheckoutFlow}, '
+            'dark=${f.darkModeEnabled}, beta=${f.betaBanner}',
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: f.darkModeEnabled ? Colors.white70 : Colors.grey,
+            ),
+          ),
+        ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FlagToggle extends StatelessWidget {
+  final String label;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+  const _FlagToggle({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SwitchListTile(
+      title: Text(label),
+      value: value,
+      onChanged: onChanged,
+      dense: true,
+    );
+  }
+}
+
+// ===========================================================================
+// TAB 4 — Capturing print output in a zone
+// ===========================================================================
+
+class _LogCaptureDemo extends StatefulWidget {
+  const _LogCaptureDemo();
+
+  @override
+  State<_LogCaptureDemo> createState() => _LogCaptureDemoState();
+}
+
+class _LogCaptureDemoState extends State<_LogCaptureDemo> {
+  final _capturedLines = <String>[];
+  bool _capturing = false;
+
+  // Run a simulated widget-like action inside a zone that intercepts print.
+  Future<void> _runWithCapture() async {
+    final captured = <String>[];
+    setState(() {
+      _capturing = true;
+    });
+
+    await Zone.current.fork(
+      specification: ZoneSpecification(
+        print: (self, parent, zone, line) {
+          captured.add(line);
+          // Also forward to real console so debugPrint still works.
+          parent.print(zone, '(captured) $line');
+        },
+      ),
+    ).run(() async {
+      print('Widget build started');
+      await Future.delayed(const Duration(milliseconds: 30));
+      print('Fetching remote config…');
+      await Future.delayed(const Duration(milliseconds: 50));
+      print('Config loaded: {theme: "ocean", lang: "en"}');
+      print('Rendering home screen');
+      await Future.delayed(const Duration(milliseconds: 20));
+      print('First frame painted ✓');
+    });
+
+    setState(() {
+      _capturedLines.addAll(captured);
+      _capturing = false;
+    });
+  }
+
+  void _clear() => setState(() => _capturedLines.clear());
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _SectionCard(
+          title: 'Capturing print output per zone',
+          description:
+              'ZoneSpecification.print intercepts every print() call in the '
+              'zone — including calls from deep inside async chains.\n\n'
+              'Useful in widget tests to assert on log output without '
+              'polluting the test console.',
+          child: Wrap(
+            spacing: 8,
+            children: [
+              FilledButton.tonal(
+                onPressed: _capturing ? null : _runWithCapture,
+                child: _capturing
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Run with capture'),
+              ),
+              OutlinedButton(onPressed: _clear, child: const Text('Clear')),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (_capturedLines.isEmpty)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'Captured lines will appear here.',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+          )
+        else
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${_capturedLines.length} lines captured',
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                  const Divider(height: 16),
+                  SelectableText(
+                    _capturedLines
+                        .asMap()
+                        .entries
+                        .map((e) => '${e.key + 1}: ${e.value}')
+                        .join('\n'),
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 13,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ===========================================================================
+// Shared UI helpers
+// ===========================================================================
+
+class _SectionCard extends StatelessWidget {
+  final String title;
+  final String description;
+  final Widget child;
+
+  const _SectionCard({
+    required this.title,
+    required this.description,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text(
+              description,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const Divider(height: 24),
+            child,
+          ],
+        ),
+      ),
+    );
+  }
 }
